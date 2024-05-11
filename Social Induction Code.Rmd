@@ -1,0 +1,333 @@
+---
+title: "Social Induction Code"
+output: html_notebook
+---
+```{r}
+library(dplyr)
+library(igraph)
+library(lubridate)
+
+library(devtools)
+
+#devtools::install_github("stan-dev/rstan")
+
+#devtools::install_github("paul-buerkner/brms", build_vignettes = FALSE)
+library(brms)
+library(rstan)
+library(StanHeaders)
+library(BH)
+library(Rcpp)
+library(RcppEigen)
+library(RcppParallel)
+library(inline)
+library(loo)
+library(pkgbuild)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(bayesplot)
+library(brms)
+#library(dagitty)
+library(reshape2)
+library(ggridges)
+library(MetBrewer)
+library(bayestestR)
+library(ggeffects)
+```
+
+```{r}
+#Bringing in data
+ite.data <- read.csv("NewITEData4.csv")
+
+#Scaling all continuous values
+ite.data$Estimate.s<-scale(ite.data$Estimate, scale=TRUE, center = TRUE)
+ite.data$Age.s<-scale(ite.data$Age, scale=TRUE, center = TRUE)
+ite.data$elo.s<-scale(ite.data$elo, scale=TRUE, center = TRUE)
+ite.data$troop.nb.s<-scale(ite.data$troop.nb, scale=TRUE, center = TRUE)
+ite.data$eig.g.vector.s<-scale(ite.data$eig.g.vector, scale=TRUE, center = TRUE)
+ite.data$eig.p.vector.s<-scale(ite.data$eig.p.vector, scale=TRUE, center = TRUE)
+ite.data$Part.Count.s<-scale(ite.data$Part.Count, scale=TRUE, center = TRUE)
+ite.data$Opposing.Count.s<-scale(ite.data$Opposing.Count, scale=TRUE, center = TRUE)
+
+#Turning aggression levels into ordered factors to run ordinal models
+ite.data$juve.level<- as.factor(ite.data$juve.level)
+ite.data$juve.level<- as.ordered(ite.data$juve.level)
+ite.data$mum.level<- as.factor(ite.data$mum.level)
+ite.data$mum.level<- as.ordered(ite.data$mum.level)
+
+#Change Sex to factor
+
+ite.data$Sex<- as.factor(ite.data$Sex)
+
+#Filtering to just participants
+ite.data.in<- ite.data %>% filter(juve.in==1)
+```
+
+```{r}
+#Setting weakly informative priors
+my.weak.priors.ite <- prior("normal(0,1)", class="b")
+```
+
+#Participation Model
+```{r}
+#Participation model using varying intercepts and slopes including opposing troop
+fit.participation<- brm(juve.in ~ Age.s + relevel(Sex, ref="M")  + mum.in + troop.nb.s + elo.s + eig.g.vector.s + eig.p.vector.s + Estimate.s + Part.Count.s * Opposing.Count.s + (1|ID/Troop) + (1|Opposing.Troop) , family=bernoulli(link="logit"), data=ite.data, iter=2500, chains = 4,cores = 4, backend = "cmdstanr", threads=threading(2), adapt_delta= 0.995, prior=my.weak.priors.ite)
+```
+
+```{r}
+#Traceplot of fit.ite.new17
+fit.part.trace<-plot(fit.participation, ask=F)
+fit.part.trace
+```
+
+```{r}
+#Posterior predictive check
+fit.participation.pp<- pp_check(fit.participation)
+fit.participation.pp
+```
+
+```{r}
+#Summary table
+fit.part.summ<-summary(fit.participation)
+fit.part.summ
+```
+
+```{r}
+#R-squareds for the model
+fit.part.cond<-bayes_R2(fit.participation) #conditional R2 = condition on the random effects (observational level random effect)
+fit.part.marg<-bayes_R2(fit.participation, re_formula=NA) #Marginal R2 = what predictors explain
+fit.part.cond
+fit.part.marg
+```
+
+```{r}
+#In the first step, we essentially extract the main effect estimates (“b_...“) from the posterior samples file, and then translate them into long form before applying ggplot
+post_samples_fit.participation <- posterior_samples(fit.participation)
+head(post_samples_fit.participation  %>% round(1))
+str(post_samples_fit.participation )
+fit.participation.t <- select(post_samples_fit.participation ,contains("b_"))
+fit.participation.t
+fit.participation.t <- fit.participation.t %>% select(1:12)
+str(fit.participation.t)
+fit.participation.t1 <- melt(fit.participation.t)
+str(fit.participation.t1)
+```
+```{r}
+##This plot specifies the upper and lower CIs and colours the inner 95% region.
+fit.participation.plot <- ggplot(fit.participation.t1, aes(x = value, y = variable, fill=factor(..quantile..))) +
+ stat_density_ridges(rel_min_height = 0.01, geom = "density_ridges_gradient", size = 0.3,
+       calc_ecdf = TRUE, quantiles = c(0.025, 0.975)) +
+ scale_fill_manual(name = NULL, values = met.brewer("Hokusai2")) +
+ theme_classic(base_size = 15) + vline_at(0, size= 0.5, color = "black", linetype = "dashed") + scale_y_discrete(expand = c(0.01, 0), limits = rev(levels(as.factor(fit.participation.t1$variable))), labels= c("Non-Adult Troop Parts:Opp Troop Parts", "# of Participants from Opposing Troop", "# of Participants from Non-Adult's Troop", "Personality", "Spatial Eigenvector", "Groom Eigenvector", "Rank", "# of Individuals in Troop", "Maternal Participation", "Sex", "Age", "Intercept"))
+fit.participation.plot + geom_hline(yintercept = 2:13, size=0.1, linetype="dotted") + labs(x = "Intercept", y="") + theme(legend.position = "none", text = element_text(size = 14, colour="black", family="times"))
+```
+
+```{r make pred dataframe}
+
+#make the changes to counts
+opp.part <- seq(-1, 1, length.out = 30)
+own.part <- seq(-1, 1, length.out = 30)
+d1.part <- expand.grid(opp=opp.part, own=own.part)
+
+#make the dataframe
+df_pred_part <- data.frame(Age.s = 0, Sex='M', mum.in=0, troop.nb.s=0, elo.s = 0, eig.g.vector.s=0, eig.p.vector.s=0, Estimate.s=0, Part.Count.s=d1.part$own, Opposing.Count.s=d1.part$opp, Troop='rst', Opposing.Troop='rbm',ID='amy')
+
+#make prediction
+predictions.part <- brms::posterior_epred(fit.participation, newdata=df_pred_part, re_formula =NA)
+
+#take a look at the structure
+str(predictions.part)
+#8000 samples, of 100 predictions: where each value is a probability of being at that level
+
+dim(predictions.part)
+
+predictions.part<- as.data.frame(predictions.part)
+
+#bind them together
+library(dplyr)
+df_pred_part2<- cbind(df_pred_part, t(predictions.part))
+df_pred_part2$pred <- rowMeans(df_pred_part2[ , c(15,5013)], na.rm=TRUE)
+df_pred_part2<-df_pred_part2 %>% select(Age.s, Sex, mum.in, troop.nb.s, elo.s, eig.g.vector.s, eig.p.vector.s, Estimate.s, Part.Count.s, Opposing.Count.s, Troop, Opposing.Troop, ID, pred )
+
+#take a look
+df_pred_part2
+
+```
+
+
+```{r}
+#Make a plot that shows if a decrease in Opp or increase in Own has more of an impact on participation
+library(ggplot2)
+ggplot(data = df_pred_part2, aes(x = Part.Count.s, y = Opposing.Count.s, fill = pred)) + 
+  geom_raster(interpolate = TRUE) +
+  scale_fill_gradientn(colours = rev(rainbow(7)), na.value = NA) +
+  theme_bw() + labs(x='Count: own troop', y='Count: opposing troop', fill='Probability of participation') + 
+  geom_abline(slope=1, intercept = 0)
+```
+
+
+#New Intensity model
+```{r}
+fit.intensity <- brm(juve.level ~ Age.s + relevel(Sex, ref="M")  + mo(mum.level) + troop.nb.s + elo.s + eig.g.vector.s + eig.p.vector.s + Estimate.s + Part.Count.s *  Opposing.Count.s + (1|ID/Troop) + (1|Opposing.Troop), family=sratio(link="logit"), data=ite.data.in, iter=4000, chains = 4, cores = 4, backend = "cmdstanr", threads=threading(2), prior=my.weak.priors.ite,  adapt_delta= 0.995)
+```
+
+```{r}
+#Traceplot
+fit.int.trace<-plot(fit.intensity, ask=F)
+fit.int.trace
+```
+
+```{r}
+#Posterior predictive check
+fit.int.pp<-pp_check(fit.intensity)
+fit.int.pp
+```
+
+```{r}
+#Summary table
+fit.int.summ<-summary(fit.intensity)
+fit.int.summ
+```
+
+```{r}
+#In the first step, we essentially extract the main effect estimates (“b_...“) from the posterior samples file, and then translate them into long form before applying ggplot
+post_samples_fit.intensity <- posterior_samples(fit.intensity)
+head(post_samples_fit.intensity  %>% round(1))
+str(post_samples_fit.intensity )
+fit.intensity.t <- select(post_samples_fit.intensity ,contains(c("b_", "mum.level")))
+fit.intensity.t 
+fit.intensity.t<- fit.intensity.t %>% select(-c(14,15,16,17, 19,20,21,22))
+str(fit.intensity.t)
+fit.intensity.t1 <- melt(fit.intensity.t)
+str(fit.intensity.t1)
+```
+
+```{r}
+##This plot specifies the upper and lower CIs and colours the inner 95% region.
+fit.intensity.plot <- ggplot(fit.intensity.t1, aes(x = value, y = variable, fill=factor(..quantile..))) +
+ stat_density_ridges(rel_min_height = 0.01, geom = "density_ridges_gradient", size = 0.3, calc_ecdf = TRUE, quantiles = c(0.025, 0.975)) +
+ scale_fill_manual(name = NULL, values = met.brewer("Hokusai2")) +
+ theme_classic(base_size = 15) + vline_at(0, size= 0.5, color = "black", linetype = "dashed") + scale_y_discrete(expand = c(0.01, 0), limits = rev(levels(as.factor(fit.intensity.t1$variable))),labels= c("Maternal Intensity", "Non-Adult Troop Parts:Opp Troop Parts", "# of Participants from Opposing Troop", "# of Participants from Non-Adult's Troop", "Personality", "Spatial Eigenvector", "Groom Eigenvector", "Rank", "# of Individuals in Troop", "Sex", "Age", "Intercept3", "Intercept2", "Intercept1"))
+fit.intensity.plot + geom_hline(yintercept = 2:15, size=0.1, linetype="dotted") + labs(x = "Intercept", y="") + theme(legend.position = "none", text = element_text(size = 14, colour="black", family="times"))
+```
+```{r make pred dataframe}
+
+#make the changes to counts
+opp.int <- seq(-1, 1, length.out = 30)
+own.int <- seq(-1, 1, length.out = 30)
+d1.int <- expand.grid(opp=opp.int, own=own.int)
+
+#make the dataframe
+df_pred_int <- data.frame(Age.s = 0, Sex='M', mum.level=1, troop.nb.s=0, elo.s = 0, eig.g.vector.s=0, eig.p.vector.s=0, Estimate.s=0, Part.Count.s=d1.int$own, Opposing.Count.s=d1.int$opp, Troop='rst', Opposing.Troop='rbm',ID='amy')
+
+#make prediction
+predictions.int <- brms::posterior_epred(fit.intensity, newdata=df_pred_int, re_formula =NA)
+
+#take a look at the structure
+str(predictions.int)
+#8000 samples, of 100 predictions, for 1-4 levels: where each value is a probability of being at that level
+
+#let's get the mean and 95%ci for each level for each prediction 
+mean_lvl_1 = apply(predictions.int[,,1],2, FUN=mean) #the 2 here says to apply mean to all the 100 columns
+mean_lvl_2 = apply(predictions.int[,,2],2, FUN=mean) #the 2 here says to apply mean to all the 100 columns
+mean_lvl_3 = apply(predictions.int[,,3],2, FUN=mean) #the 2 here says to apply mean to all the 100 columns
+mean_lvl_4 = apply(predictions.int[,,4],2, FUN=mean) #the 2 here says to apply mean to all the 100 columns
+
+
+#bind them together
+df_pred_int$pred_lvl_1 <- mean_lvl_1
+df_pred_int$pred_lvl_2 <- mean_lvl_2
+df_pred_int$pred_lvl_3 <- mean_lvl_3
+df_pred_int$pred_lvl_4 <- mean_lvl_4
+
+#take a look
+df_pred_int
+
+```
+
+Trying to make a plot that shows if a decrease in Opp or increase in Own has more of an impact on participation
+-hahah maybe not the rainbow pallet? Not sure it works here...?
+```{r}
+library(ggplot2)
+ggplot(data = df_pred_int, aes(x = Part.Count.s, y = Opposing.Count.s, fill = pred_lvl_4)) + 
+  geom_raster(interpolate = TRUE) +
+  scale_fill_gradientn(colours = rev(rainbow(7)), na.value = NA) +
+  theme_bw() + labs(x='Count: own troop', y='Count: opposing troop', fill='Probability of aggressive participation') + 
+  geom_abline(slope=1, intercept = 0)
+```
+#Groom Model 
+```{r}
+#Bring in data
+df.groom.igc<- read.csv("Grooming IGC Data.csv")
+
+#Scale continuous
+df.groom.igc$Age.s<-scale(df.groom.igc$Age, scale=TRUE, center = TRUE)
+df.groom.igc$elo.s<-scale(df.groom.igc$elo, scale=TRUE, center = TRUE)
+df.groom.igc$Estimate.s<-scale(df.groom.igc$Estimate, scale=TRUE, center = TRUE)
+df.groom.igc$eig.p.vector.s<-scale(df.groom.igc$eig.p.vector, scale=TRUE, center = TRUE)
+df.groom.igc$eig.g.vector.s<-scale(df.groom.igc$eig.g.vector, scale=TRUE, center = TRUE)
+df.groom.igc$troop.nb.s<-scale(df.groom.igc$troop.nb, scale=TRUE, center = TRUE)
+df.groom.igc$Part.Count.s<-scale(df.groom.igc$Part.Count, scale=TRUE, center = TRUE)
+df.groom.igc$Opposing.Count.s<-scale(df.groom.igc$Opposing.Count, scale=TRUE, center = TRUE)
+
+#Set priors
+my.weak.priors.ite <- prior("normal(0,1)", class="b")
+```
+
+```{r}
+fit.groom<- brm(Juve.Groom ~ juve.in + Age.s + elo.s + Estimate.s + eig.p.vector.s + eig.g.vector.s + Sex + troop.nb.s + Part.Count.s + Opposing.Count.s + (1|ID/Troop) , family="bernoulli", data=df.groom.igc, prior=my.weak.priors.ite, iter=3500, chains = 4,cores = 4, backend = "cmdstanr", threads = threading(2), control=list(adapt_delta=0.995))
+```
+
+```{r}
+#Traceplot 
+plot(fit.groom, ask=F)
+```
+
+```{r}
+#Posterior predictive check
+pp_check(fit.groom)
+```
+
+```{r}
+#Summary table
+summary(fit.groom)
+```
+
+
+```{r}
+#R-squareds for the model
+fit.groom.cond<-bayes_R2(fit.groom, ndraws=350) #conditional R2 = condition on the random effects (observational level random effect)
+fit.groom.marg<-bayes_R2(fit.groom, re_formula=NA, ndraws=350) #Marginal R2 = what predictors explain
+fit.groom.cond
+fit.groom.marg
+```
+
+
+```{r}
+#In the first step, we essentially extract the main effect estimates (“b_...“) from the posterior samples file, and then translate them into long form before applying ggplot
+post_samples_fit.groom <- posterior_samples(fit.groom)
+head(post_samples_fit.groom %>% round(1))
+str(post_samples_fit.groom)
+fit.groom.t <- select(post_samples_fit.groom ,contains("b_"))
+fit.groom.t
+fit.groom.t <- fit.groom.t %>% select(1:11)
+str(fit.groom.t)
+fit.groom.t1 <- melt(fit.groom.t)
+str(fit.groom.t1)
+```
+
+```{r}
+##This plot specifies the upper and lower CIs and colours the inner 95% region.
+fit.groom.plot <- ggplot(fit.groom.t1, aes(x = value, y = variable, fill=factor(..quantile..))) +
+ stat_density_ridges(rel_min_height = 0.01, geom = "density_ridges_gradient", size = 0.3,
+       calc_ecdf = TRUE, quantiles = c(0.025, 0.975)) +
+ scale_fill_manual(name = NULL, values = met.brewer("Hokusai2")) +
+ theme_classic(base_size = 15) + vline_at(0, size= 0.5, color = "black", linetype = "dashed") + scale_y_discrete(expand = c(0.01, 0), limits = rev(levels(as.factor(fit.groom.t1$variable))), labels= c("# of Participants from Opposing Troop", "# of Participants from Non-Adult's Troop", "# of Individuals in Troop", "Sex", "Grooming Eigenvector", "Spatial Eigenvector", "Personality", "Rank", "Age", "Non-Adult Participation", "Intercept")) 
+fit.groom.plot + geom_hline(yintercept = 2:11, size=0.1, linetype="dotted") + labs(x = "Intercept", y="") + theme(legend.position = "none", text = element_text(size = 14, colour="black", family="times"))
+```
+
+```{r}
+save.image(file="SocialInduction.RData")
+```
+

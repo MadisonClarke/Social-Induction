@@ -1,0 +1,662 @@
+---
+title: "Mother_grooming New"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(rstan)
+library(tidybayes)
+library(bayesplot)
+library(ggridges)
+library(reshape2)
+library(brms)
+library(Rlab)
+library(ggplot2)
+library(cowplot)
+```
+
+```{r}
+#Load environment
+load("mother_grooming.RData")
+```
+
+```{r}
+#Bring in Data
+df <- read.csv("Mom Groom Data.csv")
+
+df <- df %>% filter(juve.in>0)
+
+df
+```
+
+```{r}
+#Scale continuous variables and change sex to integer
+df$age.s <- as.vector(scale(df$Age))
+df$elo.s <- as.vector(scale(df$elo))
+df$sex<- as.integer(factor(df$Sex))
+
+#Remove NAs in age
+df <- df %>% filter(!is.na(age.s)) #|> sample_frac(0.1)
+
+#Create grouping variables for mom nested in troop then juve nested in mom nested in troop
+df$troop_mom <- paste0(df$Troop,"",df$mum.id)
+df$troop_mom_juve <- paste0(df$troop_mom,"",df$ID)
+
+#get number of juves
+l = unique(df$ID)
+df$id <- as.numeric(factor(df$ID, levels=l))
+table(df$id)
+
+#get number of moms
+l = unique(df$mum.id)
+df$mom_id <- as.numeric(factor(df$mum.id, levels=l))
+table(df$mom_id)
+
+#Create data list for our stan model
+d_stan <- list(juve = df$id, 
+    J = length(unique(df$id)), 
+    mom = as.numeric(as.factor(df$mom_id)), 
+    M = length(unique(df$mum.id)), 
+    mg = df$Mum.Groom, 
+    gj = df$Juve.Groom,
+    jin = df$juve.in,
+    age = df$age.s,
+    elo = df$elo.s,
+    sex = df$sex,
+    troop = as.numeric(factor(df$Troop)), 
+    R = length(unique(df$Troop)), 
+    N = nrow(df),
+    troop_mom= as.numeric(factor(df$troop_mom)),
+    TM= length(unique(df$troop_mom)),
+    troop_mom_juve= as.numeric(factor(df$troop_mom_juve)),
+    TMJ=length(unique(df$troop_mom_juve)))
+
+#take a look
+str(d_stan)
+```
+
+```{r}
+options(mc.cores = parallel::detectCores())  # indicate stan to use multiple cores if available
+
+#Nested model with sex
+groom_model_6 <- stan(file = "hurdle_groom_inter2_nested.stan", data = d_stan, iter = 500, chains = 8, cores=4)
+
+save.image(file="mother_grooming.RData")
+```
+
+```{r}
+#Traceplot
+traceplot(groom_model_6, pars = c("beta"), inc_warmup = TRUE)
+```
+
+```{r}
+#Summary table
+print(groom_model_6, pars = c("beta"), probs = c(0.025, 0.975), 
+    digits = 2)
+```
+
+Take a look at the pp_check
+
+http://mjskay.github.io/tidybayes/index.html
+
+```{r}
+library(tidybayes)
+library(bayesplot)
+library(ggridges)
+library(reshape2)
+library(brms)
+library(Rlab)
+library(ggplot2)
+
+#Extract posterior samples
+post_test <- as.data.frame(groom_model_6)
+post_test_sub <- post_test %>% select(contains("beta") )
+#df_post <- post %>% gather_draws(beta[i], ndraws=10)
+post_test_sub_melt <- melt(post_test_sub) 
+
+
+post_test_sub_melt <- post_test_sub_melt %>% mutate(param = recode_factor(variable, "beta[1]"="Intercept_pg", "beta[2]"="age_pg","beta[3]"="elo_pg","beta[4]"="sex_pg","beta[5]"="intercept_pmg","beta[6]"="age_pmg","beta[7]"="elo_pmg","beta[8]"="sex_pmg") )
+
+#plot the density plots of the parameters estimates
+ggplot(post_test_sub_melt, aes(x=value, y=param )) + geom_density_ridges() + geom_vline(xintercept = 0, linetype="dashed")
+ 
+
+#plot the outcomes
+df_post=post_test_sub
+
+#link function to predict outcomes from predictor variables
+link_func <- function(age=0, elo=0, sex=0, df_post, draws=100, preds=100){
+  
+  #create an output matrix
+  y_groomed <- matrix(nrow=draws, ncol=preds)
+  y_groomed_mom <- matrix(nrow=draws, ncol=preds)
+  p_j <- matrix(ncol=1,nrow=draws)
+  p_m <- matrix(ncol=1,nrow=draws)
+  
+  for(d in 1:draws){
+  
+    #get parameters
+    beta_1 <- df_post[d,1]
+    beta_2 <- df_post[d,2]
+    beta_3 <- df_post[d,3]
+    beta_4 <- df_post[d,4]
+    beta_5 <- df_post[d,5]
+    beta_6 <- df_post[d,6]
+    beta_7<- df_post[d,7]
+    beta_8<- df_post[d,8]
+    
+    #calculate probabilities
+    p_j[d] = inv_logit_scaled(beta_1 + beta_2*age + beta_3*elo + beta_4*sex)
+    p_m[d] = inv_logit_scaled(beta_5 + beta_6*age + beta_7*elo + beta_8*sex)
+    
+    #predict an output
+    for (n in 1:preds) {
+    
+    #generate a value for the observation: was the juve groomed?
+    y_groomed[d,n] = rbern(1,prob=p_j[d])
+    
+    if(y_groomed[d,n]==0){
+      
+      #if not then the mom could not have groomed!
+      y_groomed_mom[d,n]=0;
+      
+    } else {
+      
+      #if yes: did the mom groom the juve?
+      y_groomed_mom[d,n] = rbern(1,prob=p_m[d]);
+    }
+    
+  }
+  
+    
+  }
+  
+  #prepair the outputs
+  df_out <- data.frame(age=age,elo=elo,sex=sex,p_j=p_j, p_m=p_m, juve_groomed = y_groomed, mom_groomed_juve= y_groomed_mom  )
+  
+  return(df_out)
+  
+  
+}
+
+
+
+
+#posterior predictive checks
+
+df_preds <-link_func(df_post=post_test_sub, draws = 2000)
+summary(df_preds$juve_groomed.1)
+
+ggplot(df_preds, aes(x=juve_groomed.1) ) + geom_density() + geom_density(data = data.frame(grooJ = sample(d_stan$gj, size=2000) ) , aes(x=grooJ), color="blue" )
+
+
+```
+
+
+
+```{r}
+library(MetBrewer)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(ggridges)
+library(bayesplot)
+```
+
+
+
+
+```{r}
+#Extract the posteriors from the first part of the double-hurdle
+post_test_sub_melt<- as.data.frame(post_test_sub_melt)
+str(post_test_sub_melt$variable)
+
+post_test_submelt1 <-post_test_sub_melt %>% filter(variable=="beta[1]" | variable=="beta[2]" | variable=="beta[3]"|variable=="beta[4]") %>% droplevels()
+post_test_submelt2 <-post_test_sub_melt %>% filter(variable=="beta[5]" | variable=="beta[6]" | variable=="beta[7]"|variable=="beta[8]") %>% droplevels()
+
+summary(post_test_submelt1)
+```
+
+```{r}
+#Create posterior plot for the first half of the model
+post_test_submelt1.plot <- ggplot(post_test_submelt1, aes(x = value, y = param, fill=factor(..quantile..))) +
+  stat_density_ridges(rel_min_height = 0.01, geom = "density_ridges_gradient", size = 0.3,
+                      calc_ecdf = TRUE, quantiles = c(0.025, 0.975)) +
+  scale_fill_manual(name = NULL, values = met.brewer("Hokusai2")) +
+  theme_classic(base_size = 15) + vline_at(0, size= 0.5, color = "black", linetype = "dashed") +
+  scale_y_discrete(expand = c(0.01, 0), limits = rev(levels(as.factor(post_test_submelt1$param))), labels=c("Sex", "Rank", "Age", "Intercept")) +
+  xlim(-2.5, 0.5) +
+  geom_hline(yintercept = 2:3, size=0.1, linetype="dotted") +
+  labs(x = "Intercept", y="") +
+  theme(legend.position = "none",
+        text = element_text(size = 14, colour="black", family="times"))
+
+#Create posterior plot for the second half of the model
+post_test_submelt2.plot <- ggplot(post_test_submelt2, aes(x = value, y = param, fill=factor(..quantile..))) +
+  stat_density_ridges(rel_min_height = 0.01, geom = "density_ridges_gradient", size = 0.3,
+                      calc_ecdf = TRUE, quantiles = c(0.025, 0.975)) +
+  scale_fill_manual(name = NULL, values = met.brewer("Hokusai2")) +
+  theme_classic(base_size = 15) + vline_at(0, size= 0.5, color = "black", linetype = "dashed") +
+  scale_y_discrete(expand = c(0.01, 0), limits = rev(levels(as.factor(post_test_submelt2$param))), labels=c("Sex","Rank", "Age", "Intercept")) +
+  xlim(-2.5, 0.5) +
+  geom_hline(yintercept = 2:3, size=0.1, linetype="dotted") +
+  labs(x = "Intercept", y="") +
+  theme(legend.position = "none",
+        text = element_text(size = 14, colour="black", family="times"))
+
+# Combine plots and set font family
+plot_grid(post_test_submelt1.plot, post_test_submelt2.plot, nrow = 2, labels = c("a", "b")) 
+```
+
+
+```{r}
+##PD estimates 
+
+#Groomed or not
+#Grab variable of interest from posteriors for the first part of the model (groomed or not)
+post.intercept<- post_test_submelt1 %>% filter(variable=="beta[1]") %>% droplevels() #Here we'll grab the Intercept
+
+#Given our effect for Intercept is negative, we want to know how many of the posteriors are negative, so we'll use this to give us a count, divided by the number of rows in the df, and then multiplied by 100 to get the percentage
+pd.int.gr<- sum(post.intercept$value < 0) / nrow(post.intercept) * 100
+
+#Repeat for all of the variables 
+post.age<- post_test_submelt1 %>% filter(variable=="beta[2]") %>% droplevels() 
+pd.age.gr<- sum(post.age$value > 0) / nrow(post.age) * 100 #Age has a positive effect so we need to change it to >0
+
+post.rank<- post_test_submelt1 %>% filter(variable=="beta[3]") %>% droplevels() 
+pd.rank.gr<- sum(post.rank$value > 0) / nrow(post.rank) * 100 
+
+post.sex<- post_test_submelt1 %>% filter(variable=="beta[4]") %>% droplevels() 
+pd.sex.gr<- sum(post.sex$value < 0) / nrow(post.sex) * 100 
+
+pd.int.gr
+pd.age.gr
+pd.rank.gr
+pd.sex.gr
+
+#Grab variable of interest from posteriors for the first part of the model (groomed or not)
+post.intercept<- post_test_submelt1 %>% filter(variable=="beta[1]") %>% droplevels() #Here we'll grab the Intercept
+
+#Given our effect for Intercept is negative, we want to know how many of the posteriors are negative, so we'll use this to give us a count, divided by the number of rows in the df, and then multiplied by 100 to get the percentage
+pd.int.gr<- sum(post.intercept$value < 0) / nrow(post.intercept) * 100
+
+#Repeat for all of the variables 
+post.age<- post_test_submelt1 %>% filter(variable=="beta[2]") %>% droplevels() 
+pd.age.gr<- sum(post.age$value > 0) / nrow(post.age) * 100 #Age has a positive effect so we need to change it to >0
+
+post.rank<- post_test_submelt1 %>% filter(variable=="beta[3]") %>% droplevels() 
+pd.rank.gr<- sum(post.rank$value > 0) / nrow(post.rank) * 100 
+
+post.sex<- post_test_submelt1 %>% filter(variable=="beta[4]") %>% droplevels() 
+pd.sex.gr<- sum(post.sex$value < 0) / nrow(post.sex) * 100 
+
+pd.int.gr
+pd.age.gr
+pd.rank.gr
+pd.sex.gr
+
+#Groomed by mom
+#Grab variable of interest from posteriors for the first part of the model (groomed or not)
+post.intercept.mum<- post_test_submelt2 %>% filter(variable=="beta[5]") %>% droplevels() #Here we'll grab the Intercept
+
+#Given our effect for Intercept is negative, we want to know how many of the posteriors are negative, so we'll use this to give us a count, divided by the number of rows in the df, and then multiplied by 100 to get the percentage
+pd.int.mum<- sum(post.intercept.mum$value < 0) / nrow(post.intercept.mum) * 100
+
+#Repeat for all of the variables 
+post.age.mum<- post_test_submelt2 %>% filter(variable=="beta[6]") %>% droplevels() 
+pd.age.mum<- sum(post.age.mum$value < 0) / nrow(post.age.mum) * 100 
+
+post.rank.mum<- post_test_submelt2 %>% filter(variable=="beta[7]") %>% droplevels() 
+pd.rank.mum<- sum(post.rank.mum$value > 0) / nrow(post.rank.mum) * 100 
+
+post.sex.mum<- post_test_submelt2 %>% filter(variable=="beta[8]") %>% droplevels() 
+pd.sex.mum<- sum(post.sex.mum$value < 0) / nrow(post.sex.mum) * 100 
+
+pd.int.mum
+pd.age.mum
+pd.rank.mum
+pd.sex.mum
+```
+
+```{r}
+library(rstan)
+
+library(pROC)  # For ROC curve and AUC calculation
+
+# Extracting the predicted probabilities
+# Assuming 'y_pred' is the generated quantity in your Stan model that represents
+# the predicted probabilities of the positive class (1).
+# We take the mean of the posterior predictive probabilities for each observation. (we could get fancy here and do this for each sample... but let's keep it simple)
+y_pred_prob_groom <- extract(groom_model_6)$y_pred_groom
+y_pred_mean_groom <- apply(y_pred_prob_groom, 2, mean)# Taking the mean across all posterior samples
+
+# Calculate AUC 
+roc_obj_groom <- roc(response = df$Juve.Groom, predictor = y_pred_mean_groom)
+auc_value_groom<- auc(roc_obj_groom)
+
+# Print AUC value
+print(paste("AUC:", auc_value_groom))
+
+# Optionally, plot the ROC curve
+auc_groom<-plot(roc_obj_groom, main = "ROC Curve", print.auc=TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray') # Adds a diagonal line (chance level)
+
+y_pred_prob_mom <- extract(groom_model_6)$y_pred_mom
+y_pred_mean_mom <- apply(y_pred_prob_mom, 2, mean) # Taking the mean across all posterior samples
+
+# Calculate AUC 
+roc_obj_mom <- roc(response = df$Mum.Groom, predictor = y_pred_mean_mom)
+auc_value_mom<- auc(roc_obj_mom)
+
+# Print AUC value
+print(paste("AUC:", auc_value_mom))
+
+# Optionally, plot the ROC curve
+auc_mom<-plot(roc_obj_mom, main = "ROC Curve", print.auc=TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray') # Adds a diagonal line (chance level)
+
+
+# We take the mean of the posterior predictive probabilities for each observation. 
+y_pred_prob_groom_noRE <- extract(groom_model_6)$y_pred_groom_noRE
+y_pred_mean_groom_noRE <- apply(y_pred_prob_groom_noRE, 2, mean)# Taking the mean across all posterior samples
+
+# Calculate AUC 
+roc_obj_groom_noRE <- roc(response = df$Juve.Groom, predictor = y_pred_mean_groom_noRE)
+auc_value_groom_noRE<- auc(roc_obj_groom_noRE)
+
+# Print AUC value
+print(paste("AUC:", auc_value_groom_noRE))
+
+# Optionally, plot the ROC curve
+auc_groom_noRE<-plot(roc_obj_groom_noRE, main = "ROC Curve", print.auc=TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray') # Adds a diagonal line (chance level)
+
+y_pred_prob_mom_noRE <- extract(groom_model_6)$y_pred_mom_noRE
+y_pred_mean_mom_noRE <- apply(y_pred_prob_mom_noRE, 2, mean) # Taking the mean across all posterior samples
+
+# Calculate AUC 
+roc_obj_mom_noRE <- roc(response = df$Mum.Groom, predictor = y_pred_mean_mom_noRE)
+auc_value_mom_noRE<- auc(roc_obj_mom_noRE)
+
+# Print AUC value
+print(paste("AUC:", auc_value_mom_noRE))
+
+# Optionally, plot the ROC curve
+auc_mom_noRE<-plot(roc_obj_mom_noRE, main = "ROC Curve", print.auc=TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray') # Adds a diagonal line (chance level)
+
+```
+```{r}
+#Combine plots
+auc_groom<-plot(roc_obj_groom, main = "ROC Curve Groom", print.auc=TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray')
+
+auc_mom<-plot(roc_obj_mom, main = "ROC Curve Groom by Mom", print.auc=TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray') # Adds a diagonal line (chance level)
+
+auc_groom_noRE<-plot(roc_obj_groom_noRE, main = "ROC Curve Groom", print.auc=TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray')
+
+auc_mom<-plot(roc_obj_mom_noRE, main = "ROC Curve Groom by Mom", print.auc=TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray') # Adds a diagonal line (chance level)
+```
+```{r}
+#Combine plots
+auc_groom <- plot(roc_obj_groom, print.auc = TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray')
+
+# Add second ROC curve to the plot
+plot(roc_obj_groom_noRE, add = TRUE, col = "red")
+abline(a = 0, b = 1, lty = 2, col = 'gray')
+
+# Add legend
+legend("bottomright", legend = c("Full Model", "Main Effects only"), col = c("black", "red"), lty = 1)
+
+text(0.5, 0.1, paste("AUC:", round(roc_obj_groom_noRE$auc, 2)), col = "red")
+
+# Print the AUC for each curve
+print(roc_obj_groom$auc)
+print(roc_obj_groom_noRE$auc)
+
+
+auc_mom <- plot(roc_obj_mom, print.auc = TRUE)
+abline(a = 0, b = 1, lty = 2, col = 'gray')
+
+# Add second ROC curve to the plot
+plot(roc_obj_mom_noRE, add = TRUE, col = "red")
+abline(a = 0, b = 1, lty = 2, col = 'gray')
+
+# Add legend
+legend("bottomright", legend = c("Full Model", "Main Effects only"), col = c("black", "red"), lty = 1)
+
+text(0.5, 0.1, paste("AUC:", round(roc_obj_mom_noRE$auc, 2)), col = "red")
+
+# Print the AUC for each curve
+print(roc_obj_mom$auc)
+print(roc_obj_mom_noRE$auc)
+```
+
+
+```{r pred out}
+
+#predictive outcomes plots
+
+#Changing age and rank
+df_preds_age0_elo0 <-link_func(age=0, elo=0,df_post=post_test_sub, draws = 200) %>% mutate(Juve = "Mean age, Mean elo")
+df_preds_age0_elo2 <-link_func(age=0,elo=2,df_post=post_test_sub, draws = 200) %>% mutate(Juve = "Mean age, High elo")
+df_preds_age0_eloM2 <-link_func(age=0,elo=-2,df_post=post_test_sub, draws = 200)%>% mutate(Juve = "Mean age, Low elo")
+df_preds_age2_elo2 <-link_func(age=2,elo=2,df_post=post_test_sub, draws = 200)%>% mutate(Juve = "High age, High elo")
+df_preds_age2_eloM2 <-link_func(age=2,elo=-2,df_post=post_test_sub, draws = 200)%>% mutate(Juve = "High age, Low elo")
+df_preds_ageM2_eloM2 <-link_func(age=-2,elo=-2,df_post=post_test_sub, draws = 200) %>% mutate(Juve = "Low age, Low elo")
+df_preds_ageM2_elo2 <-link_func(age=-2,elo=2,df_post=post_test_sub, draws = 200) %>% mutate(Juve = "Low age, High elo")
+
+df_preds_ageM2_elo0 <-link_func(age=-2,elo=0,df_post=post_test_sub, draws = 200) %>% mutate(Juve = "Low age, Mean elo")
+df_preds_age2_elo0 <-link_func(age=2,elo=0,df_post=post_test_sub, draws = 200) %>% mutate(Juve = "High age, Mean elo")
+
+
+#Combine into one df
+df_comb_pred <-bind_rows(df_preds_ageM2_elo0,
+                         df_preds_age2_elo0,
+                         df_preds_age0_elo0,
+                         df_preds_age2_elo2,
+                         df_preds_ageM2_eloM2,
+                         df_preds_age0_elo2,
+                         df_preds_age0_eloM2,
+                         df_preds_age2_eloM2,
+                         df_preds_ageM2_elo2)
+#Create column with age and rank joined together
+df_comb_pred <-  df_comb_pred %>% mutate(age_rank = paste0(age,"_",elo) )
+
+
+#Plot age predictions for whether the juvenile was groomed
+p.pj.age <- ggplot(df_comb_pred %>% filter(Juve=="High age, Mean elo" | Juve=="Mean age, Mean elo" | Juve=="Low age, Mean elo"), aes(x=p_j, y=Juve)) + geom_density_ridges(fill="skyblue2", alpha=0.7) + xlim(0,1) + scale_y_discrete(limits = c("Low age, Mean elo", "Mean age, Mean elo", "High age, Mean elo"), labels=c("Low age, Mean Rank", "Mean age, Mean rank", "High age, Mean rank")) + labs(x="Probability non-adult participants groomed")+theme(legend.position= "right", 
+         panel.grid.major = element_blank(), 
+         panel.grid.minor = element_blank(), 
+         legend.title = element_blank(), 
+         text = element_text(size = 14, colour="black", family="times"),
+         panel.background = element_blank(), 
+         axis.line = element_line(colour = "black"),
+         axis.title.y=element_blank(),
+        axis.title.x=element_text(family="Times New Roman",size=12),
+        legend.text=element_text(size=12, family="Times New Roman"))
+
+
+#Plot age predictions for whether the juvenile was groomed by their mom
+p.pm.age <- ggplot(df_comb_pred %>% filter(Juve=="High age, Mean elo" | Juve=="Mean age, Mean elo" | Juve=="Low age, Mean elo"), aes(x=p_m, y=Juve)) + geom_density_ridges(fill="sienna1", alpha=0.7) + xlim(0,1) + scale_y_discrete(limits = c("Low age, Mean elo", "Mean age, Mean elo", "High age, Mean elo"), labels=c("Low age, Mean Rank", "Mean age, Mean rank", "High age, Mean rank")) + labs(x="Probability non-adult participants groomed by mother")+theme(legend.position= "right", 
+         panel.grid.major = element_blank(), 
+         panel.grid.minor = element_blank(), 
+         legend.title = element_blank(), 
+         text = element_text(size = 14, colour="black", family="times"),
+         panel.background = element_blank(), 
+         axis.line = element_line(colour = "black"),
+         axis.title.y=element_blank(),
+        axis.title.x=element_text(family="Times New Roman",size=12),
+        legend.text=element_text(size=12, family="Times New Roman"))
+
+
+#Join plots
+cowplot::plot_grid(p.pj.age,p.pm.age , rows=2)
+```
+
+
+
+```{r calc diff age preds}
+library(tidyr)
+library(HDInterval)
+
+
+#difference in age in pj plot
+df_pj_preds <-df_comb_pred %>% select(age, p_j)  %>% pivot_wider(names_from = age, values_from = p_j)
+
+df_pj_preds <- data.frame(age2=df_pj_preds$`2`[[1]], age0=df_pj_preds$`0`[[1]],agem2=df_pj_preds$`-2`[[1]])
+
+df_pj_preds$diff2m2 <-df_pj_preds$age2-df_pj_preds$agem2
+
+age_pj_mean <- mean(df_pj_preds$diff2m2)
+age_pj_lower <- HDInterval::hdi(df_pj_preds$diff2m2, credMass=0.95)[1]
+age_pj_upper <- HDInterval::hdi(df_pj_preds$diff2m2, credMass=0.95)[2]
+age_pj_pdir <- sum(df_pj_preds$diff2m2>0)/nrow(df_pj_preds)
+
+
+#difference in age in pj plot
+df_pm_preds <-df_comb_pred %>% select(age, p_m)  %>% pivot_wider(names_from = age, values_from = p_m)
+
+df_pm_preds <- data.frame(age2=df_pm_preds$`2`[[1]], age0=df_pm_preds$`0`[[1]],agem2=df_pm_preds$`-2`[[1]])
+
+df_pm_preds$diff2m2 <-df_pm_preds$age2-df_pm_preds$agem2
+
+age_pm_mean <- mean(df_pm_preds$diff2m2)
+age_pm_lower<-HDInterval::hdi(df_pm_preds$diff2m2, credMass=0.95)[1]
+age_pm_upper<-HDInterval::hdi(df_pm_preds$diff2m2, credMass=0.95)[2]
+age_pm_pdir <-sum(df_pm_preds$diff2m2<0)/nrow(df_pm_preds)
+
+paste0()
+paste0("Difference between high and low age on prob juve will be groomed (pj) and give they were groomed, prob juve will be groomed by mom (pm)")
+paste0("Age pj mean ", round(age_pj_mean,2))
+paste0("Age pj lower ", round(age_pj_lower,2))
+paste0("Age pj upper ", round(age_pj_upper,2))
+paste0("Age pj p dir ", round(age_pj_pdir,2))
+
+paste0("Age pm mean ", round(age_pm_mean,2))
+paste0("Age pm lower ", round(age_pm_lower,2))
+paste0("Age pm upper ", round(age_pm_upper,2))
+paste0("Age pm p dir ", round(age_pm_pdir,2))
+```
+
+Plot of predictions when changing elo
+
+```{r}
+#Plot rank predictions for whether the juvenile was groomed
+p.pj.elo <- ggplot(df_comb_pred %>% filter(Juve=="Mean age, Low elo" | Juve=="Mean age, Mean elo" | Juve=="Mean age, High elo"), aes(x=p_j, y=Juve)) + geom_density_ridges(fill="skyblue2", alpha=0.7) + xlim(0,1) + scale_y_discrete(limits = c("Mean age, Low elo", "Mean age, Mean elo", "Mean age, High elo"),labels=c("Mean age, Low Rank", "Mean age, Mean rank", "Mean age, Highrank")) + labs(x="Probability non-adult participants groomed")+theme(legend.position= "right", 
+         panel.grid.major = element_blank(), 
+         panel.grid.minor = element_blank(), 
+         legend.title = element_blank(), 
+         text = element_text(size = 14, colour="black", family="times"),
+         panel.background = element_blank(), 
+         axis.line = element_line(colour = "black"),
+         axis.title.y=element_blank(),
+        axis.title.x=element_text(family="Times New Roman",size=12),
+        legend.text=element_text(size=12, family="Times New Roman"))
+
+#Plot rank predictions for whether the juvenile was groomed by their mom
+p.pm.elo <- ggplot(df_comb_pred %>% filter(Juve=="Mean age, Low elo" | Juve=="Mean age, Mean elo" | Juve=="Mean age, High elo"), aes(x=p_m, y=Juve)) + geom_density_ridges(fill="sienna1", alpha=0.7) + xlim(0,1) + scale_y_discrete(limits = c("Mean age, Low elo", "Mean age, Mean elo", "Mean age, High elo"),labels=c("Mean age, Low Rank", "Mean age, Mean rank", "Mean age, Highrank")) + labs(x="Probability non-adult participants groomed by mother")+theme(legend.position= "right", 
+         panel.grid.major = element_blank(), 
+         panel.grid.minor = element_blank(), 
+         legend.title = element_blank(), 
+         text = element_text(size = 14, colour="black", family="times"),
+         panel.background = element_blank(), 
+         axis.line = element_line(colour = "black"),
+         axis.title.y=element_blank(),
+        axis.title.x=element_text(family="Times New Roman",size=12),
+        legend.text=element_text(size=12, family="Times New Roman"))
+
+
+#Join plots
+cowplot::plot_grid(p.pj.elo,p.pm.elo , rows=2)
+```
+
+
+```{r}
+#difference in elo in pj plot
+df_pj_predselo <-df_comb_pred %>% select(elo, p_j)  %>% pivot_wider(names_from = elo, values_from = p_j)
+
+df_pj_predselo <- data.frame(elo2=df_pj_predselo$`2`[[1]], elo0=df_pj_predselo$`0`[[1]],elom2=df_pj_predselo$`-2`[[1]])
+
+df_pj_predselo$diff2m2 <-df_pj_predselo$elo2-df_pj_predselo$elom2
+
+elo_pj_mean <- mean(df_pj_predselo$diff2m2)
+elo_pj_lower <- HDInterval::hdi(df_pj_predselo$diff2m2, credMass=0.95)[1]
+elo_pj_upper <- HDInterval::hdi(df_pj_predselo$diff2m2, credMass=0.95)[2]
+elo_pj_pdir <- sum(df_pj_predselo$diff2m2>0)/nrow(df_pj_predselo)
+
+
+
+
+#difference in elo in pm plot
+df_pm_predselo <-df_comb_pred %>% select(elo, p_m)  %>% pivot_wider(names_from = elo, values_from = p_m)
+
+df_pm_predselo <- data.frame(elo2=df_pm_predselo$`2`[[1]], elo0=df_pm_predselo$`0`[[1]],elom2=df_pm_predselo$`-2`[[1]])
+
+df_pm_predselo$diff2m2 <-df_pm_predselo$elo2-df_pm_predselo$elom2
+
+elo_pm_mean <- mean(df_pm_predselo$diff2m2)
+elo_pm_lower <- HDInterval::hdi(df_pm_predselo$diff2m2, credMass=0.95)[1]
+elo_pm_upper <- HDInterval::hdi(df_pm_predselo$diff2m2, credMass=0.95)[2]
+elo_pm_pdir <- sum(df_pm_predselo$diff2m2>0)/nrow(df_pm_predselo)
+
+
+
+paste0("Difference between high and low elo on prob juve will be groomed (pj) and give they were groomed, prob juve will be groomed by mom (pm)")
+paste0("elo pj mean ", round(elo_pj_mean,2))
+paste0("elo pj lower ", round(elo_pj_lower,2))
+paste0("elo pj upper ", round(elo_pj_upper,2))
+paste0("elo pj p dir ", round(elo_pj_pdir,2))
+
+paste0("elo pm mean ", round(elo_pm_mean,2))
+paste0("elo pm lower ", round(elo_pm_lower,2))
+paste0("elo pm upper ", round(elo_pm_upper,2))
+paste0("elo pm p dir ", round(elo_pm_pdir,2))
+
+```
+
+```{r}
+#Make predicitve plots for sex
+df_preds_sexM <-link_func(sex=2, df_post=post_test_sub, draws = 200) %>% mutate(Juve = "Male")
+df_preds_sexF <-link_func(sex=1, df_post=post_test_sub, draws = 200) %>% mutate(Juve = "Female")
+
+df_preds_sex<- bind_rows(df_preds_sexM, df_preds_sexF)
+
+#Plot for whether the juvenile was groomed
+p.pj.sex <- ggplot(df_preds_sex, aes(x=p_j, y=Juve)) + geom_density_ridges(fill="skyblue2", alpha=0.7) + xlim(0,1) + scale_y_discrete() + labs(x="Probability non-adult participants groomed")+theme(legend.position= "right", 
+         panel.grid.major = element_blank(), 
+         panel.grid.minor = element_blank(), 
+         legend.title = element_blank(), 
+         text = element_text(size = 14, colour="black", family="times"),
+         panel.background = element_blank(), 
+         axis.line = element_line(colour = "black"),
+         axis.title.y=element_blank(),
+        axis.title.x=element_text(family="Times New Roman",size=12),
+        legend.text=element_text(size=12, family="Times New Roman"))
+
+#Plot for whether the juvenile was groomed by their mom
+p.pm.sex <- ggplot(df_preds_sex, aes(x=p_m, y=Juve)) + geom_density_ridges(fill="sienna1", alpha=0.7) + xlim(0,1) + scale_y_discrete() + labs(x="Probability non-adult participants groomed by mother")+theme(legend.position= "right", 
+         panel.grid.major = element_blank(), 
+         panel.grid.minor = element_blank(), 
+         legend.title = element_blank(), 
+         text = element_text(size = 14, colour="black", family="times"),
+         panel.background = element_blank(), 
+         axis.line = element_line(colour = "black"),
+         axis.title.y=element_blank(),
+        axis.title.x=element_text(family="Times New Roman",size=12),
+        legend.text=element_text(size=12, family="Times New Roman"))
+
+#Join plots
+cowplot::plot_grid(p.pj.sex,p.pm.sex , rows=2)
+```
+
+```{r}
+#Save environment
+save.image(file="mother_grooming.RData")
+```
+
